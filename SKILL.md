@@ -1,7 +1,7 @@
 ---
 name: 3x-ui-cascade-hiddify
 description: Use when configuring two 3X-UI/Xray servers as a cascade where Hiddify on Windows connects to a Russian entry server, which forwards traffic to a foreign exit server.
-version: 1.1.1
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, windows]
@@ -88,6 +88,16 @@ Do not use for:
 - Tor/I2P/anonymity network setup;
 - requests involving illegal activity;
 - promising guaranteed anonymity, censorship bypass, or unblockability.
+
+## Docker Testing (no real servers)
+
+When no real VPS servers are available, the cascade can be simulated with two Docker containers on one machine. See `references/cascade-implementation-notes.md` → "Docker testing approach" for commands and validation scope.
+
+Key constraints:
+- 3x-ui API has CSRF protection — get token from `/csrf-token` first, login with `username`/`password` fields (not `user`/`passwd`).
+- Never edit `config.json` directly — 3x-ui regenerates it from SQLite on restart.
+- Outbound connections and routing rules are NOT in the database — they live in the Xray template. Use `/panel/xray/update` with form field `xraySetting` (see "3X-UI API Pitfalls" section).
+- Default metrics listener (`127.0.0.1:11111`) may conflict with inbound ports — check and change via `metrics.listen` in the template before adding inbounds on 11111.
 
 ## First Response / Confirmation
 
@@ -762,6 +772,87 @@ Layer check:
 ```
 
 Fix the first failing layer only. Do not randomly change multiple layers.
+
+## Docker Testing (Single-Host Simulation)
+
+When no two real servers are available, the cascade can be validated on a single machine using Docker containers.
+
+### Architecture
+```text
+curl (test client) → RU container (localhost:11112 mixed) → Foreign container (foreign-cascade:22220) → internet
+```
+
+### Steps
+1. Create Docker network: `docker network create cascade-net`
+2. Pull image: `docker pull bigbugcc/3x-ui:latest`
+3. Run foreign container: `docker run -d --name foreign-cascade --network cascade-net --hostname foreign-cascade -p 22210:2053 -p 22220:22220 bigbugcc/3x-ui:latest`
+4. Run RU container: `docker run -d --name ru-cascade --network cascade-net --hostname ru-cascade -p 11110:2053 -p 11111:11111 bigbugcc/3x-ui:latest`
+5. Configure via API (see pitfalls below)
+6. Test: `docker exec ru-cascade sh -c 'curl -s --proxy http://127.0.0.1:11112 http://ifconfig.me'`
+
+### Verification
+- Foreign server traffic stats must show non-zero `up`/`down` after test requests
+- `netstat -tn` on foreign port 22220 should show connections from RU container IP
+- Hiddify VLESS link must point to RU container (localhost:11111), NOT foreign
+
+### Limitations
+- Both containers share the same external IP (same Docker host) — cannot verify exit IP difference
+- SSH, ufw, firewalld checks are irrelevant in Docker
+- Reality/TLS testing requires a real domain
+
+## 3X-UI API Pitfalls
+
+### CSRF Protection
+3X-UI has CSRF protection. All API calls require:
+1. GET `/csrf-token` → extract `obj` field as CSRF token
+2. POST `/login` with `{"username":"admin","password":"admin"}` + `X-CSRF-Token` header
+3. All subsequent requests need `X-CSRF-Token` header
+
+### Xray Config Update
+The `/panel/xray/update` endpoint expects form-encoded data with field name `xraySetting`:
+```python
+import requests, json
+s = requests.Session()
+# ... login ...
+config = s.get('http://host:port/panel/xray/getDefaultJsonConfig').json()['obj']
+# Modify config['outbounds'], config['routing']['rules'], etc.
+s.post('http://host:port/panel/xray/update',
+       data={'xraySetting': json.dumps(config)},
+       headers={'X-CSRF-Token': csrf})
+```
+**Pitfall:** Sending as JSON body or wrong field name returns `"unexpected end of JSON input"`. Must use `data=` (form-encoded) with field name `xraySetting`.
+
+### Two-Step Configuration Process
+3X-UI separates inbound management (database) from outbound/routing (Xray template). You cannot configure everything through one API call:
+
+**Step A — Create inbounds** via `/panel/api/inbounds/add` (JSON body). This creates the database records. Both Hiddify inbound (RU) and service inbound (foreign) are created this way.
+
+**Step B — Configure outbound + routing** via `/panel/xray/update` (form field `xraySetting`). First fetch the current template with `GET /panel/xray/getDefaultJsonConfig`, then add your outbound and routing rule to it, then POST back. Without this step, Xray has no outbound to the foreign server and no routing rule.
+
+**Step C — Restart** the container or service to apply the new Xray config.
+
+### Default Credentials
+Fresh 3X-UI Docker image uses `admin` / `admin`. Change after first login in production.
+
+### Inbound Creation
+```python
+s.post('http://host:port/panel/api/inbounds/add',
+       json={...},  # JSON body works for inbounds
+       headers={'X-CSRF-Token': csrf})
+```
+Supported protocols: `vmess vless trojan shadowsocks wireguard hysteria http mixed tunnel`. SOCKS is NOT supported — use `mixed` for HTTP+SOCKS proxy.
+
+### Config Persistence
+3X-UI stores Xray template in SQLite `settings` table with key `xraySetting`. Inbounds are in the `inbounds` table. On restart, `config.json` is regenerated from the database. Direct file edits are overwritten on restart.
+
+### Port Conflict
+Default metrics listener uses `127.0.0.1:11111` which conflicts with custom inbounds on port 11111. Change `metrics.listen` to a different port (e.g., `127.0.0.1:62790`) before adding inbounds on 11111.
+
+### SQLite WAL Mode
+The database uses WAL mode. To read/modify from outside the container:
+1. Install sqlite in container: `apk add --no-cache sqlite`
+2. Checkpoint WAL: `sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);"`
+3. Then copy: `docker cp container:/etc/x-ui/x-ui.db /tmp/db.sqlite`
 
 ## Completion Checklist
 
