@@ -1,7 +1,7 @@
 ---
 name: 3x-ui-cascade-hiddify
-description: Use when configuring two 3X-UI/Xray servers as a cascade where Hiddify on Windows connects to a Russian entry server, which forwards traffic to a foreign exit server.
-version: 1.2.0
+description: Use when configuring two 3X-UI/Xray servers as a cascade where Hiddify on Windows connects to a Russian entry server, which forwards traffic to a foreign exit server. Version-aware, capability-aware, idempotent, transactional with backup and rollback.
+version: 2.0.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, windows]
@@ -18,9 +18,12 @@ metadata:
 Use this skill to configure or diagnose a two-server 3X-UI/Xray cascade. Keep this file class-level and compact; session-specific implementation notes belong in `references/`.
 
 Support files:
-- `references/cascade-implementation-notes.md` — compact implementation notes, client-role split, protocol cautions, rollback intent.
 
-For a compact implementation summary, see `references/cascade-implementation-notes.md`.
+- `references/cascade-implementation-notes.md` — implementation notes, client-role split, protocol cautions, Docker simulation.
+- `references/api-compatibility.md` — 3x-ui API endpoint matrix, capability detection, discovery procedure, curl examples.
+- `references/acceptance-tests.md` — full acceptance test table, critical tests, negative tests, DNS/IPv6/UDP procedures.
+- `references/security-and-rollback.md` — secret handling, backup procedure (SQLite WAL-safe), detailed rollback commands.
+- `references/troubleshooting.md` — structured symptom → check → fix tables, MTU/MSS diagnostics, log collection.
 
 ```text
 Windows 11 + Hiddify → Russian 3X-UI server → foreign 3X-UI server → internet
@@ -32,6 +35,57 @@ Do not treat this as two independent proxy servers. The required shape is:
 
 ```text
 RU inbound for Hiddify → RU outbound to foreign server → foreign inbound → foreign direct/freedom outbound
+```
+
+## Core Operating Model
+
+The skill must never assume: "3x-ui always works as described in SKILL.md". Every run follows:
+
+```text
+discover → detect capabilities → backup → plan → apply → validate → commit success
+```
+
+On failure:
+
+```text
+failure → diagnose → rollback → verify restored state
+```
+
+Key principles:
+
+1. **Runtime API > documented assumptions.** Never treat an endpoint or payload structure as guaranteed just because it is written in SKILL.md. If the installed 3x-ui version differs from the last tested one, probe the actual API first.
+2. **Capability detection before version guessing.** Choose endpoints by probing what actually responds, not by assuming from the version number alone. A version is only a hint.
+3. **Idempotency.** Every object is looked up before creation. A re-run on a correctly configured system must end with `NO CHANGES REQUIRED` or a minimal update, never duplicates.
+4. **Transactional changes.** Backup before change, validate after change, roll back if critical tests fail.
+5. **Fail-safe.** If the agent cannot confidently determine API schema, existing routing, or a rollback path, it must not make destructive changes. Read-only discovery, diagnostics, and a report are allowed.
+
+## Capability Matrix
+
+Internal decision table. Each capability is determined by probing, not assumed:
+
+```text
+Capability                         Preferred behavior
+
+Modern /panel/api/* available      Use modern API
+Typed payload supported            Use typed JSON (nested objects)
+Live apply available               Apply without full restart
+API token configured               Prefer token auth (no CSRF flow)
+Legacy only                        Use legacy compatibility path
+Unknown API                        Stop before destructive action
+```
+
+See `references/api-compatibility.md` for the detection procedure and endpoint matrix.
+
+Discovery summary output (no secret values):
+
+```text
+3x-ui version: 3.x.x
+API mode: modern
+Authentication: API token
+Xray API: available
+Inbound API: available
+Live apply: supported
+Legacy fallback: not required
 ```
 
 ## Client Roles and Routing Identity
@@ -71,6 +125,19 @@ The foreign server client credentials are service credentials for RU outbound on
 
 If the user explicitly asks for a direct foreign-only profile, treat it as a separate bypass profile and keep it clearly outside the cascade's main Hiddify import path.
 
+## Standard Object Names
+
+Use predictable identifiers for objects this skill creates. If existing configuration uses different names, do not rename it without need — adopt the existing names and record them in the plan.
+
+```text
+Foreign inbound tag:        from-ru
+Foreign service client:     ru-to-foreign-client
+RU Hiddify inbound tag:     hiddify-entry
+RU Hiddify client:          windows-hiddify-client
+RU foreign outbound tag:    to-foreign
+Routing rule:               hiddify-entry → to-foreign
+```
+
 ## When to Use
 
 Use when the user asks to:
@@ -89,69 +156,49 @@ Do not use for:
 - requests involving illegal activity;
 - promising guaranteed anonymity, censorship bypass, or unblockability.
 
-## Docker Testing (no real servers)
+## Confirmation Workflow and approved_scope
 
-When no real VPS servers are available, the cascade can be simulated with two Docker containers on one machine. See `references/cascade-implementation-notes.md` → "Docker testing approach" for commands and validation scope.
+Do not interrogate the user step by step. Ask for the access details once, then ask for a single approval covering the whole scope:
 
-Key constraints:
-- 3x-ui API has CSRF protection — get token from `/csrf-token` first, login with `username`/`password` fields (not `user`/`passwd`).
-- Never edit `config.json` directly — 3x-ui regenerates it from SQLite on restart.
-- Outbound connections and routing rules are NOT in the database — they live in the Xray template. Use `/panel/xray/update` with form field `xraySetting` (see "3X-UI API Pitfalls" section).
-- Default metrics listener (`127.0.0.1:11111`) may conflict with inbound ports — check and change via `metrics.listen` in the template before adding inbounds on 11111.
+> Правильно ли я понял, что нужно настроить два сервера с 3X-UI в каскадную схему, где российский сервер принимает трафик от Hiddify на Windows 11, а зарубежный сервер является конечной точкой выхода в интернет? Разрешаете по ходу работы устанавливать недостающее ПО, открывать необходимые порты, изменять конфигурацию 3X-UI/Xray и перезапускать сервисы?
 
-## First Response / Confirmation
+If the user approves this scope (`approved_scope`), proceed through all routine steps without re-asking: discovery, backup, creating/updating cascade objects, opening required firewall ports, live apply, service restart, validation.
 
-Before configuring anything, confirm the task and stop for the user's approval:
+Additional explicit confirmation is required ONLY for:
 
-> Правильно ли я понял, что нужно настроить два сервера с 3X-UI в каскадную схему, где российский сервер принимает трафик от Hiddify на Windows 11, а зарубежный сервер является конечной точкой выхода в интернет?
-
-Do not install, restart, reconfigure, or open ports until the user has provided the required access details and explicitly approved starting work.
+- destructive deletion of existing objects;
+- deleting unknown existing objects;
+- changing SSH server configuration;
+- disabling the firewall;
+- replacing an existing working inbound;
+- server reboot;
+- actions that may cut remote access;
+- rollback that would discard newly applied working changes.
 
 ## Data to Request Before Starting
 
-Ask for both servers separately.
+Ask for both servers separately. Keep it to one message.
 
 ### Russian entry server
 
 - IP address or domain.
-- SSH port.
-- SSH username.
-- SSH auth method: key, password, or other.
+- SSH port, username, auth method (key, password, other).
 - Whether the user has root or sudo.
-- Whether 3X-UI is already installed.
-- If installed: panel URL/port and whether panel access works.
+- Whether 3X-UI is already installed; if installed: panel URL/port and whether panel access works.
 - Which port may be opened for the Hiddify client.
-- Firewall type: ufw, firewalld, iptables/nftables, provider firewall.
-- Provider firewall / security group state.
-- Whether a domain is available.
-- Whether TLS/Reality/certificates are required.
+- Firewall type: ufw, firewalld, iptables/nftables, provider firewall; provider firewall/security group state.
+- Whether a domain is available; TLS/Reality/certificate requirements.
 - Existing inbounds/outbounds that must not be touched.
 
 ### Foreign exit server
 
-- IP address or domain.
-- Country/location.
-- SSH port.
-- SSH username.
-- SSH auth method.
-- Whether the user has root or sudo.
-- Whether 3X-UI is already installed.
-- If installed: panel URL/port and whether panel access works.
-- Which port may be opened for RU → foreign connection.
-- Firewall type and provider firewall state.
-- Whether a domain is available.
-- Whether TLS/Reality/certificates are required.
-- Existing inbounds/outbounds that must not be touched.
+Same fields as RU, plus country/location and which port may be opened for the RU → foreign connection.
 
 ### Hiddify/client choices
 
-- Desired protocol: VLESS, VLESS+Reality, Trojan, Shadowsocks, VMess, Hysteria2, or other.
-- If the user does not choose a protocol, propose this default and ask for confirmation before applying it:
-  - Hiddify → RU: VLESS + Reality.
-  - RU → foreign: VLESS or Trojan, depending on what is simpler and more reliable for the two 3X-UI panels.
-- Whether import link/subscription or manual profile is preferred.
-- Whether domain/TLS is required or IP-only is acceptable.
-- Whether traffic should look like HTTPS.
+- Desired protocol: VLESS, VLESS+Reality, Trojan, Shadowsocks, VMess, Hysteria2, or other. If not chosen, propose the default (see Protocol Selection) and get one confirmation.
+- Import link/subscription vs manual profile.
+- Domain/TLS vs IP-only.
 - Number of client profiles needed.
 
 ## SSH Credential Safety Rules
@@ -168,346 +215,137 @@ Ask for both servers separately.
 - Do not remove existing services or 3X-UI objects without explicit permission.
 - Do not overwrite full Xray configs without backup.
 
-## Preflight Checks Before Any Change
+## Transactional Workflow
 
-Run this on both servers before any configuration changes:
+### Phase 1 — Discovery (read-only, both servers)
 
-```bash
-whoami
-hostname
-uname -a
-cat /etc/os-release
-id
-date
-timedatectl status || true
-df -h
-free -h
-ps -p 1 -o comm=
-ss -tulpen
+Collect and record:
+
+```text
+OS, architecture, kernel          cat /etc/os-release; uname -m; uname -a
+3x-ui version                     x-ui version / 3x-ui version / /panel/API endpoint
+Xray version                      xray version
+running services                  systemctl status x-ui / 3x-ui; ps aux
+listening ports                   ss -tulpen
+firewall (OS + provider)          ufw/firewalld/iptables/nft + provider state marked UNKNOWN if unverifiable
+install mode                      systemd vs Docker
+panel availability                HTTP probe of the panel URL
+API capabilities                  see 3X-UI API Discovery below
+current inbounds/outbounds/routing
 ```
 
-Check required tools:
+Provider firewall is a separate layer from the OS firewall. If the provider firewall/security group cannot be verified, record `Provider firewall status: UNKNOWN` and do not claim the port is reachable just because `ufw allow` succeeded.
 
-```bash
-command -v curl || true
-command -v jq || true
-command -v ss || true
-command -v systemctl || true
-command -v ufw || true
-command -v firewall-cmd || true
-command -v iptables || true
-command -v nft || true
-command -v nc || true
-command -v openssl || true
-```
+### 3X-UI API Discovery
 
-If the user provided a domain, verify name resolution:
+Before any write, run API discovery on each server. The procedure and endpoint matrix live in `references/api-compatibility.md`; the mandatory checks:
 
-```bash
-getent hosts <DOMAIN> || true
-dig <DOMAIN> || true
-nslookup <DOMAIN> || true
-```
+1. Determine the 3x-ui version (CLI or panel).
+2. Probe the modern Xray API: `GET /panel/api/xray/getDefaultJsonConfig`.
+3. If modern responds — use it; probe legacy `/panel/xray/getDefaultJsonConfig` only as fallback.
+4. Probe inbound API: `GET /panel/api/inbounds/list`.
+5. Determine authentication: API token if configured, else CSRF session flow.
+6. Determine live apply support (does the Xray config update apply without a panel restart?).
+7. Fix the result as the discovery summary (see Capability Matrix) and use it for all subsequent calls.
 
-Time sync matters because TLS and Reality can fail when server clocks are wrong. If time is broken, fix or ask the user before continuing.
+Read-modify-write rule for the Xray template: the CURRENT saved template is read via `POST /panel/api/xray/` (getXraySetting). `GET getDefaultJsonConfig` returns the DEFAULT template — using it as the read source wipes existing outbounds/routing on the next update (verified on v3.7.0; details in `references/api-compatibility.md`).
 
-## Backup Before Changes
+If a known endpoint later returns 404/405 or a schema mismatch, do not immediately assume installation failure — re-run API discovery.
 
-Before modifying 3X-UI, Xray, routing, or firewall state, create a dated backup directory and store system state there.
+Never choose a legacy endpoint merely because the version "looks old": probe first.
+
+### Phase 2 — Backup
+
+Before modifying 3X-UI, Xray, routing, or firewall state, create a dated backup directory on each server. Detailed procedure (including SQLite WAL-safe copy) is in `references/security-and-rollback.md`.
 
 Minimum backup scope:
 
-- OS and host identity;
-- current listeners and service state;
+- OS and host identity, service state, port listeners;
 - firewall state;
-- current 3X-UI/Xray configuration if the path is known and readable;
-- current inbound/outbound/routing objects if they can be exported safely;
-- if 3X-UI panel/API can export existing objects, save those exports into the backup directory;
+- 3x-ui database (WAL-safe: do not copy a live SQLite DB inconsistently when WAL is active — use the built-in backup command or checkpoint first);
+- 3x-ui settings / Xray template;
+- exported inbounds, outbounds, routing (via API export when available);
 - never dump secrets into chat or the final report.
-
-Example:
-
-```bash
-BACKUP_DIR="$HOME/3x-ui-cascade-backup-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-
-uname -a > "$BACKUP_DIR/uname.txt"
-cat /etc/os-release > "$BACKUP_DIR/os-release.txt" 2>/dev/null || true
-whoami > "$BACKUP_DIR/whoami.txt"
-hostname > "$BACKUP_DIR/hostname.txt"
-id > "$BACKUP_DIR/id.txt"
-date > "$BACKUP_DIR/date.txt"
-timedatectl status > "$BACKUP_DIR/timedatectl.txt" 2>/dev/null || true
-ss -tulpen > "$BACKUP_DIR/ports.txt" 2>/dev/null || true
-systemctl list-units --type=service > "$BACKUP_DIR/services.txt" 2>/dev/null || true
-ufw status verbose > "$BACKUP_DIR/ufw.txt" 2>/dev/null || true
-firewall-cmd --list-all > "$BACKUP_DIR/firewalld.txt" 2>/dev/null || true
-iptables -S > "$BACKUP_DIR/iptables.txt" 2>/dev/null || true
-nft list ruleset > "$BACKUP_DIR/nft.txt" 2>/dev/null || true
-```
 
 If backup cannot be created, stop and ask the user whether to continue without backup. Default answer is no.
 
-Optional discovery if the 3X-UI/Xray path is unknown:
+### Phase 3 — Plan
 
-```bash
-find /etc /usr/local /opt -maxdepth 4 \( -iname '*x-ui*' -o -iname '*xray*' \) 2>/dev/null | head -n 50
-```
-
-## Rollback Plan
-
-Before making changes, the agent must be able to explain the rollback path.
-
-Rollback must include:
-
-- restoring the previous 3X-UI/Xray configuration from backup if one exists;
-- removing any inbound/outbound/routing objects created for the cascade;
-- closing any newly opened firewall ports;
-- restarting affected services;
-- confirming that pre-existing services are still healthy;
-- deleting any temporary SSH user or temporary key if one was created.
-
-If rollback path is unknown, do not proceed.
-
-## Operating Algorithm
-
-### 1. Verify SSH access
-
-For each server:
-
-```bash
-ssh -p <SSH_PORT> <USER>@<HOST> 'whoami && hostname && uname -a'
-```
-
-Check sudo:
-
-```bash
-sudo -n true && echo sudo-ok || echo sudo-needs-password
-```
-
-Check OS and identity:
-
-```bash
-cat /etc/os-release
-id
-uname -a
-```
-
-After SSH is confirmed on a server, run the Preflight Checks Before Any Change block on that same server before making any other modification.
-
-### 2. Check system readiness
-
-```bash
-df -h
-free -h
-date
-ps -p 1 -o comm=
-ss -tulpen
-```
-
-If the same host facts were already captured in Preflight Checks Before Any Change, reuse those results unless the system state changed.
-
-Check firewall:
-
-```bash
-command -v ufw && ufw status verbose
-command -v firewall-cmd && firewall-cmd --list-all
-command -v iptables && iptables -S
-command -v nft && nft list ruleset
-```
-
-### 3. Check 3X-UI/Xray
-
-```bash
-systemctl status x-ui --no-pager || true
-systemctl status 3x-ui --no-pager || true
-ps aux | grep -Ei 'x-ui|3x-ui|xray' | grep -v grep || true
-command -v x-ui || true
-command -v 3x-ui || true
-command -v xray || true
-x-ui version || true
-3x-ui version || true
-xray version || true
-ss -tulpen
-```
-
-Support two scenarios:
-
-1. **3X-UI is already installed on both servers.** Prefer this path when possible: verify services, panel access, existing inbounds/outbounds, and only add the minimum required inbound/outbound/routing objects. Do not reinstall or overwrite existing configuration.
-2. **3X-UI is not installed on one or both servers.** Tell the user exactly where it is missing and ask for explicit confirmation before installing from scratch on the missing server(s).
-
-If 3X-UI is missing, use only the official 3X-UI install source. Show the install command before running it.
-
-### 4. Choose protocol layout
-
-The Hiddify-facing protocol must be supported by Hiddify and 3X-UI. The server-to-server protocol must be supported by 3X-UI/Xray outbound on RU and inbound on foreign.
-
-Common layout:
+Before applying anything, build an internal change plan distinguishing new objects from reused/updated ones:
 
 ```text
-Hiddify → RU: VLESS+Reality, Trojan TLS, Shadowsocks, VMess, or Hysteria2
-RU → foreign: VLESS, Trojan, Shadowsocks, VMess, or Reality
-foreign → internet: freedom/direct
+Foreign:
++ inbound from-ru            (create / reuse: <found tag>)
++ service client             (create / reuse: <found email>)
++ firewall port              (create / already present)
+
+RU:
++ Hiddify inbound            (create / reuse: <found tag>)
++ outbound to-foreign        (create / reuse)
++ routing rule               (create / reuse)
++ Hiddify client             (create / reuse: <found email>)
 ```
 
-If the user did not choose a protocol, recommend this default and wait for confirmation:
+### Idempotency Rules
+
+Before creating each object, search for an existing one. Check at minimum: inbound tag, inbound remark, port, protocol, client email/name, client UUID, outbound tag, routing rule tag/match.
 
 ```text
-Hiddify → RU: VLESS + Reality
-RU → foreign: VLESS or Trojan
-foreign → internet: freedom/direct
+not found                      → create
+exists and compatible          → reuse
+exists, minor change needed    → update
+conflicts with the architecture → STOP, report conflict, do not overwrite automatically
 ```
 
-Use VLESS/Trojan for RU → foreign based on actual 3X-UI support, existing panel configuration, need for TLS/Reality, and the user's domain/certificate situation. Do not silently choose a different protocol without saying why.
-
-Reality is a VLESS-family option. Do not pair Reality with non-VLESS protocols.
-
-### 5. Configure foreign server as exit
-
-Create an inbound on the foreign 3X-UI server for the Russian server to connect to. Inside that inbound, create a service client dedicated to the RU → foreign hop.
-
-Recommended names/tags:
-
-- inbound tag: `from-ru`;
-- service client name: `ru-to-foreign-client`.
-
-Required properties:
-
-- listen on appropriate external interface, normally `0.0.0.0`;
-- port: `<FOREIGN_INBOUND_PORT>`;
-- protocol and credentials matching RU outbound;
-- TLS/Reality parameters if used;
-- outbound/default route to `freedom`/direct internet;
-- do not give this service client to the user as the Hiddify import profile.
-
-Open only the required port.
-
-For TCP-based protocols, open TCP only. For Hysteria2/TUIC/QUIC-based transports, open UDP as required. Do not open both TCP and UDP unless the selected protocol explicitly needs both.
-
-ufw:
+Port collision detection before creating any inbound:
 
 ```bash
-ufw allow <FOREIGN_INBOUND_PORT>/tcp
-ufw status verbose
+ss -lntup
 ```
 
-If the selected protocol requires UDP, add the matching UDP rule too:
+Check existing services, Xray listeners, 3x-ui panel, metrics listeners, SSH, web servers, Docker proxies. If the port is occupied: do not kill the process. Choose another port or stop and report.
 
-```bash
-ufw allow <FOREIGN_INBOUND_PORT>/udp
-ufw status verbose
+Metrics conflict: do not assume metrics always listens on `127.0.0.1:11111` — detect any metrics listener dynamically (parse the Xray template for `metrics` / `api` blocks and cross-check `ss -lntup`).
+
+### Existing installation preservation
+
+If 3x-ui is already installed: `DO NOT reinstall` without a proven reason. First inspect, reuse, make minimal modifications.
+
+If installation is required, use only the official 3x-ui install source. Show the source and verify repository identity before running anything. No random mirrors or third-party install scripts.
+
+### Phase 4 — Configure foreign
+
+Create or update (per plan): foreign inbound `from-ru`, service client `ru-to-foreign-client`, firewall port.
+
+Open only the required port. For TCP-based protocols, open TCP only. For Hysteria2/TUIC/QUIC-based transports, open UDP as required. Do not open both TCP and UDP unless the selected protocol explicitly needs both.
+
+After the change, run local validation (Phase 5). Do not proceed to RU if the foreign inbound does not work.
+
+### Phase 5 — Validate foreign
+
+Check:
+
+```text
+Xray running                    systemctl status / container state
+port listening                  ss -lntup
+firewall allows traffic         OS firewall + provider firewall state recorded
+service client exists           API/inbound export
+inbound active                  API list
+configuration valid             Xray log has no config errors
 ```
 
-firewalld:
+### Phase 6 — Configure RU
 
-```bash
-firewall-cmd --permanent --add-port=<FOREIGN_INBOUND_PORT>/tcp
-firewall-cmd --reload
-firewall-cmd --list-all
-```
-
-If the selected protocol requires UDP, add the matching UDP rule too:
-
-```bash
-firewall-cmd --permanent --add-port=<FOREIGN_INBOUND_PORT>/udp
-firewall-cmd --reload
-firewall-cmd --list-all
-```
-
-Verify listening:
-
-```bash
-ss -tulpen | grep <FOREIGN_INBOUND_PORT>
-```
-
-From the Russian server, verify reachability:
-
-```bash
-nc -vz <FOREIGN_HOST> <FOREIGN_INBOUND_PORT>
-```
-
-Fallback without `nc`:
-
-```bash
-timeout 5 bash -c '</dev/tcp/<FOREIGN_HOST>/<FOREIGN_INBOUND_PORT>' && echo open || echo closed
-```
-
-### 6. Configure Russian server as entry
-
-Create Hiddify-facing inbound on RU server and create the user-facing client there.
-
-Recommended names/tags:
-
-- inbound tag: `hiddify-in`;
-- user client name: `windows-hiddify-client`.
-
-Required properties:
-
-- listen: normally `0.0.0.0`;
-- port: `<RU_CLIENT_PORT>`;
-- protocol chosen for Hiddify;
-- UUID/password/user credentials;
-- transport/TLS/Reality settings as chosen;
-- this is the only client that should be exported or imported into Hiddify.
-
-Create RU outbound to the foreign inbound.
-
-Open only the Hiddify client port.
-
-For TCP-based protocols, open TCP only. For Hysteria2/TUIC/QUIC-based transports, open UDP as required. Do not open both TCP and UDP unless the selected protocol explicitly needs both.
-
-```bash
-ufw allow <RU_CLIENT_PORT>/tcp
-ufw status verbose
-```
-
-If the selected protocol requires UDP, add the matching UDP rule too:
-
-```bash
-ufw allow <RU_CLIENT_PORT>/udp
-ufw status verbose
-```
-
-or:
-
-```bash
-firewall-cmd --permanent --add-port=<RU_CLIENT_PORT>/tcp
-firewall-cmd --reload
-firewall-cmd --list-all
-```
-
-If the selected protocol requires UDP, add the matching UDP rule too:
-
-```bash
-firewall-cmd --permanent --add-port=<RU_CLIENT_PORT>/udp
-firewall-cmd --reload
-firewall-cmd --list-all
-```
-
-Verify listening:
-
-```bash
-ss -tulpen | grep <RU_CLIENT_PORT>
-```
-
-### 7. Configure RU routing
-
-In 3X-UI/Xray on the Russian server, prefer the safest available control path:
-
-1. 3X-UI panel/API, if credentials and access are available.
-2. Existing 3X-UI CLI/menu tools, if they support the required operation.
-3. Direct Xray/3X-UI config edits only when panel/API is unavailable or insufficient, and only after creating a backup.
-
-If 3X-UI manages Xray configuration, do not manually rewrite the whole Xray JSON unless there is no safer option and the user approved that method.
+Create or update (per plan): Hiddify-facing inbound `hiddify-entry`, client `windows-hiddify-client`, outbound `to-foreign`, routing rule `hiddify-entry → to-foreign`, firewall port.
 
 Required routing state:
 
-- tag the Hiddify-facing inbound, e.g. `hiddify-in`;
-- tag the outbound to foreign, e.g. `to-foreign`;
-- add routing rule mapping `inboundTag: hiddify-in` to `outboundTag: to-foreign`;
-- ensure client traffic does not fall through to RU direct/freedom outbound.
+- Hiddify-facing inbound has tag `hiddify-entry` (or the pre-existing equivalent);
+- outbound to foreign has tag `to-foreign`;
+- routing rule maps `inboundTag: [hiddify-entry]` → `outboundTag: to-foreign`;
+- client traffic must not fall through to the RU direct/freedom outbound.
 
-Logical structure:
+Logical structure (adapt to the actual API/config shape):
 
 ```json
 {
@@ -515,7 +353,7 @@ Logical structure:
     "rules": [
       {
         "type": "field",
-        "inboundTag": ["hiddify-in"],
+        "inboundTag": ["hiddify-entry"],
         "outboundTag": "to-foreign"
       }
     ]
@@ -523,96 +361,204 @@ Logical structure:
 }
 ```
 
-This is a logical example, not a copy-paste full config. Adapt it to 3X-UI's UI/API/config shape and selected protocols.
+If 3x-ui manages Xray configuration, do not manually rewrite the whole Xray JSON unless there is no safer option and the user approved that method. Never edit runtime `config.json` directly — 3x-ui regenerates it from the database on restart.
 
-Restart only if required:
+### Live Apply Rules
 
-```bash
-systemctl restart x-ui || systemctl restart 3x-ui
-systemctl status x-ui --no-pager || systemctl status 3x-ui --no-pager
-```
-
-Check logs:
-
-```bash
-journalctl -u x-ui -n 100 --no-pager || true
-journalctl -u 3x-ui -n 100 --no-pager || true
-```
-
-### 8. Create Hiddify profile
-
-The Hiddify profile must point to the Russian server, not the foreign server.
-
-Before giving the profile to the user, inspect the primary address/host. If the generated Hiddify link contains the foreign server host or IP as the primary target, stop and report a configuration error.
-
-Include only the parameters required by the chosen protocol:
-
-- RU address/domain;
-- RU client port;
-- protocol;
-- UUID/password;
-- transport;
-- TLS/Reality settings;
-- SNI/server name if needed;
-- Reality public key/short ID/fingerprint/flow if needed.
-
-Do not expose full subscription links or secrets in final answer unless the user explicitly asks and understands the risk.
-By default, redact UUIDs, passwords, and similar fields when a concise report is enough.
-
-### 9. Verify route
-
-Expected result:
+Default to live apply; restart is the exception:
 
 ```text
-Hiddify external IP == foreign server IP/location
+change config → attempt live apply → validate
 ```
 
-On foreign server:
+Restart only if:
+
+- live apply is unavailable;
+- live apply returned an error;
+- Xray requires a restart for that specific change;
+- runtime state does not match configuration;
+- the agent has proven the necessity.
+
+Before restarting: state the reason, verify the backup exists, and note the impact on active connections. Never restart "just in case".
+
+### Phase 7 — RU → Foreign verification
+
+Before testing Hiddify, prove the Russian Xray can reach the foreign inbound:
 
 ```bash
-curl -4 ifconfig.me
-curl -4 ipinfo.io/ip
+# from RU server
+nc -vz <FOREIGN_HOST> <FOREIGN_INBOUND_PORT>
+# fallback without nc
+timeout 5 bash -c '</dev/tcp/<FOREIGN_HOST>/<FOREIGN_INBOUND_PORT>' && echo open || echo closed
 ```
 
-## Client-Side Verification on Windows 11 + Hiddify
+Then verify the RU outbound actually connects (Xray log shows an established outbound connection or the API reports non-zero traffic on the `to-foreign` outbound after a test request).
 
-On user client via Hiddify, ask the user to verify manually on Windows 11:
+### Phase 8 — End-to-end verification
 
-1. Disable other VPN/proxy clients temporarily to avoid a false result.
-2. Open Hiddify.
-3. Import or manually add the profile that points to the Russian server.
-4. Connect to the profile.
-5. Open:
+Run the acceptance tests in `references/acceptance-tests.md`. Critical tests that MUST be PASS before reporting success:
 
 ```text
-https://ifconfig.me
-https://ipinfo.io/ip
+Foreign inbound operational
+RU outbound reaches foreign
+RU routing sends Hiddify traffic to foreign
+Hiddify primary target == RU
+External IPv4 == expected foreign server/network
+Xray healthy on both servers
 ```
 
-6. Confirm that the shown external IP/location belongs to the foreign server, not the Russian server and not the user's ISP.
+If any critical test fails, the configuration must not be reported as successful. If critical tests fail after apply, roll back (see Rollback).
 
-On foreign server, verify connections from RU:
+### Protocol Selection
 
-```bash
-ss -tnp | grep <FOREIGN_INBOUND_PORT> || true
+Keep this default unless validation says otherwise:
+
+```text
+Hiddify → RU: VLESS + Reality
+RU → foreign: VLESS
+foreign → internet: freedom/direct
 ```
 
-On RU server, checking `curl ifconfig.me` only shows the RU server's own direct IP and does not prove client routing. The decisive test is the IP observed from the Hiddify client.
+Before committing to a protocol, verify against the actual environment:
+
+- support by the installed Xray (probe, don't assume);
+- support by Hiddify;
+- existing firewall and provider firewall;
+- domain availability;
+- TLS/Reality requirements;
+- UDP requirements.
+
+Do not use a protocol just because it is listed in SKILL.md.
+
+Reality is a VLESS-family option. Do not pair Reality with non-VLESS protocols.
+
+### Reality Validation
+
+When Reality is used, verify on the correct sides:
+
+```text
+serverName (SNI)        matches between inbound and client profile
+publicKey               present in the client profile / RU outbound
+privateKey              present only on the server side (never print it)
+shortId                 present and hex
+fingerprint             set (e.g. chrome)
+flow                    consistent (e.g. xtls-rprx-vision)
+target/dest             reachable from the server
+```
+
+Sanity checks: public/private key role mismatch (private key in a client profile = config error), invalid shortId characters, wrong SNI, wrong fingerprint.
+
+### Hiddify Profile Validation
+
+The Hiddify profile must point to the Russian server, not the foreign server. Before giving the profile to the user, validate:
+
+```text
+scheme                  matches the chosen protocol
+host/address            == RU entry (if == foreign server → FAIL, stop)
+port                    matches the RU inbound
+UUID/password           present, matches the RU inbound client
+security                none/TLS/Reality as chosen
+Reality/TLS             publicKey/shortId/fingerprint/SNI present when Reality
+SNI, fingerprint, flow  consistent with the inbound
+transport               TCP/ws/grpc/httpQUIC as chosen
+ALPN                    if relevant to the chosen transport
+```
+
+### Hiddify Smoke Test
+
+If the client machine is accessible to the agent:
+
+```text
+1. Generate/import profile.
+2. Start connection.
+3. Verify connection established.
+4. Verify external IPv4 == foreign server.
+5. Verify DNS (see acceptance tests).
+6. Verify UDP where applicable.
+7. Verify IPv6 behavior.
+```
+
+If the agent cannot control Hiddify directly, give the user the minimal checklist from `references/acceptance-tests.md`.
+
+### DNS, IPv6, UDP Testing
+
+Mandatory parts of end-to-end verification (detailed procedures in `references/acceptance-tests.md`):
+
+- **DNS:** determine which resolver is actually used; detect DNS leaking directly via RU/local ISP when foreign egress is expected. Output `DNS STATUS: PASS / WARNING / FAIL`.
+- **IPv6:** test both IPv4 and IPv6. `IPv4 foreign / IPv6 disabled` → PASS; `IPv4 foreign / IPv6 foreign` → PASS; `IPv4 foreign / IPv6 RU/local` → FAIL or WARNING depending on user requirements. A foreign IPv4 alone does not prove full routing.
+- **UDP:** if the protocol or user traffic implies UDP, validate it. Do not open UDP firewall ports without need. Output `UDP: PASS / FAIL / N/A`.
+
+### MTU/MSS Diagnostics
+
+For "connection established but sites partially load / large downloads hang / QUIC fails": check MTU, PMTU, MSS, fragmentation. Do not change MTU automatically without a proven cause. See `references/troubleshooting.md`.
+
+## Docker Testing (no real servers)
+
+When no real VPS servers are available, the cascade can be simulated with two Docker containers on one machine. Full procedure: `references/cascade-implementation-notes.md` → "Docker testing approach"; CI script: `tests/cascade_docker_test.py`.
+
+Key constraints:
+
+- Use the official image `ghcr.io/mhsanaei/3x-ui` with a **pinned version** for acceptance tests (e.g. `THREEXUI_VERSION=v3.7.0`). Never `latest` as the default; a separate compatibility run with `latest` is allowed.
+- 3x-ui API has CSRF protection — get token from `/csrf-token` first, login with `username`/`password` fields (not `user`/`passwd`); API token (Settings → Security) bypasses CSRF when available.
+- Never edit `config.json` directly — 3x-ui regenerates it from SQLite on restart.
+- Outbound connections and routing rules are NOT in the database — they live in the Xray template (update via the Xray API).
+- Default metrics listener may conflict with inbound ports — detect the metrics listener dynamically and move it via `metrics.listen` in the template before adding an inbound on that port.
+
+Docker tests are an integration test, not production validation. Docker proves: Xray config, protocol handshake, routing, service-client architecture, TCP flow. Docker does NOT prove: provider firewall, cloud security groups, ISP routing, MTU, public IPv4/IPv6, Reality behavior in a real network, SNI/CDN, Hiddify on Windows, real DNS leaks, UDP through the production path.
+
+## Logs and Secret Redaction
+
+When diagnosing, collect 3x-ui service logs, Xray logs, `journalctl`, Docker logs — then redact before showing:
+
+Always redact: UUID, password, Reality private key, API token, session cookie, subscription URL, full share URI. Safe to show: host, port, protocol, tag, masked UUID (`8f23****91ab`).
+
+## Health Status Model
+
+Final report uses exactly one of:
+
+```text
+HEALTHY              all mandatory tests pass
+PARTIALLY HEALTHY    main TCP path works, but e.g. UDP FAIL / IPv6 WARNING / DNS UNKNOWN
+FAILED               main cascade path does not work
+ROLLED BACK          new configuration failed validation, previous state restored
+```
+
+If any critical acceptance test fails, the result is FAILED or ROLLED BACK — never a success status.
+
+## Rollback
+
+Rollback is part of the algorithm, not advice. If critical acceptance tests fail after applying changes: diagnose → roll back → verify restored state.
+
+Rollback must restore: previous 3x-ui state, previous Xray settings, previous inbounds, outbounds, routing, previous firewall, service state. After rollback, run rollback verification and output:
+
+```text
+ROLLBACK STATUS: SUCCESS
+```
+
+or
+
+```text
+ROLLBACK STATUS: PARTIAL FAILURE
+```
+
+With `PARTIAL FAILURE`, list explicitly what remains changed. Detailed commands: `references/security-and-rollback.md`.
 
 ## Final Report Format
 
-Use a short safe report:
+Use a short safe report with the health status and acceptance table (`references/acceptance-tests.md`), e.g.:
 
 ```text
-Готово.
+Готово. Статус: HEALTHY
 
 Схема:
 Windows 11 + Hiddify → российский сервер → зарубежный сервер → интернет
 
+Acceptance tests: (таблица PASS/FAIL/N/A — см. references/acceptance-tests.md)
+
 Что настроено:
-- Российский сервер: входная точка для Hiddify.
-- Зарубежный сервер: конечная точка выхода.
-- На российском сервере трафик клиентского inbound направлен в outbound на зарубежный сервер.
+- Российский сервер: входная точка для Hiddify (inbound hiddify-entry).
+- Зарубежный сервер: конечная точка выхода (inbound from-ru, service client ru-to-foreign-client).
+- На российском сервере трафик клиентского inbound направлен в outbound to-foreign.
 - На зарубежном сервере трафик выпускается через direct/freedom.
 - Служебный клиент на зарубежном сервере создан только для RU → foreign и не выдан пользователю.
 
@@ -627,9 +573,9 @@ Windows 11 + Hiddify → российский сервер → зарубежн�
 Проверки:
 - SSH к обоим серверам: OK/failed
 - 3X-UI на обоих серверах: OK/failed
-- Порты слушают: OK/failed
 - RU видит foreign inbound: OK/failed
 - Внешний IP через Hiddify: foreign / not verified / failed
+- DNS: PASS/WARNING/FAIL · UDP: PASS/FAIL/N/A · IPv6: PASS/WARNING/N/A
 
 Как добавить и проверить в Hiddify на Windows 11:
 1. Временно отключить другие VPN/proxy, чтобы не исказить проверку.
@@ -643,239 +589,66 @@ Windows 11 + Hiddify → российский сервер → зарубежн�
 Секретные параметры не включены в отчёт.
 ```
 
-## Diagnostics
-
-### No SSH access
-
-Symptoms: `Permission denied`, `Connection timed out`, `No route to host`, `Host key verification failed`.
-
-Check:
-
-```bash
-ssh -vvv -p <SSH_PORT> <USER>@<HOST>
-```
-
-Likely causes: wrong host, port, user, missing key, root login disabled, firewall/provider firewall, password auth disabled, changed host key.
-
-Do not brute-force passwords. Ask for corrected access or a temporary public key setup.
-
-### Port closed
-
-Check:
-
-```bash
-ss -tulpen | grep <PORT>
-ufw status verbose || true
-firewall-cmd --list-all || true
-iptables -S || true
-nft list ruleset || true
-nc -vz <HOST> <PORT>
-```
-
-Likely causes: inbound disabled, Xray not listening, local firewall, provider firewall, wrong protocol TCP/UDP, service bound to `127.0.0.1`.
-
-Open only the required port. Do not disable the firewall.
-
-### 3X-UI not working
-
-Check:
-
-```bash
-systemctl status x-ui --no-pager || true
-systemctl status 3x-ui --no-pager || true
-journalctl -u x-ui -n 200 --no-pager || true
-journalctl -u 3x-ui -n 200 --no-pager || true
-ps aux | grep -Ei 'x-ui|3x-ui|xray' | grep -v grep || true
-ss -tulpen
-```
-
-Likely causes: port conflict, invalid Xray config, wrong Reality/TLS fields, occupied panel port, disk full, permission issue.
-
-Back up config before changing. Roll back the last inbound/outbound/routing change first.
-
-### Hiddify does not connect
-
-Check:
-
-- RU address/domain;
-- RU port;
-- UUID/password;
-- protocol;
-- transport;
-- SNI;
-- ALPN;
-- fingerprint;
-- Reality public key;
-- short ID;
-- flow;
-- TLS mode;
-- client/server time.
-
-Server checks:
-
-```bash
-ss -tulpen | grep <RU_CLIENT_PORT>
-journalctl -u x-ui -n 100 --no-pager || true
-journalctl -u 3x-ui -n 100 --no-pager || true
-```
-
-Common mistake: Hiddify points to the foreign server directly instead of the Russian entry server.
-
-### Traffic exits through RU instead of foreign
-
-Check RU routing:
-
-- Hiddify inbound tag;
-- outbound tag to foreign;
-- routing rule order;
-- whether default `freedom/direct` catches traffic;
-- whether Hiddify is using the intended profile.
-
-Check foreign server sees RU connections:
-
-```bash
-ss -tnp | grep <FOREIGN_INBOUND_PORT> || true
-```
-
-Fix the routing rule instead of rebuilding the whole setup.
-
-### Firewall or DNS conflict
-
-DNS checks:
-
-```bash
-getent hosts <DOMAIN>
-dig <DOMAIN> || true
-nslookup <DOMAIN> || true
-```
-
-TLS check:
-
-```bash
-openssl s_client -connect <DOMAIN>:443 -servername <DOMAIN>
-```
-
-Likely causes: wrong A/AAAA records, wrong SNI, certificate mismatch, provider firewall, IPv6 pointing elsewhere.
-
-### Wrong inbound/outbound pairing
-
-Layer check:
-
-```text
-1. Does Hiddify reach RU inbound?
-2. Does RU inbound have the expected tag?
-3. Does routing map that tag to foreign outbound?
-4. Does RU outbound connect to foreign inbound?
-5. Does foreign inbound accept RU?
-6. Does foreign outbound use direct/freedom?
-7. Does client-observed IP equal foreign IP?
-```
-
-Fix the first failing layer only. Do not randomly change multiple layers.
-
-## Docker Testing (Single-Host Simulation)
-
-When no two real servers are available, the cascade can be validated on a single machine using Docker containers.
-
-### Architecture
-```text
-curl (test client) → RU container (localhost:11112 mixed) → Foreign container (foreign-cascade:22220) → internet
-```
-
-### Steps
-1. Create Docker network: `docker network create cascade-net`
-2. Pull image: `docker pull bigbugcc/3x-ui:latest`
-3. Run foreign container: `docker run -d --name foreign-cascade --network cascade-net --hostname foreign-cascade -p 22210:2053 -p 22220:22220 bigbugcc/3x-ui:latest`
-4. Run RU container: `docker run -d --name ru-cascade --network cascade-net --hostname ru-cascade -p 11110:2053 -p 11111:11111 bigbugcc/3x-ui:latest`
-5. Configure via API (see pitfalls below)
-6. Test: `docker exec ru-cascade sh -c 'curl -s --proxy http://127.0.0.1:11112 http://ifconfig.me'`
-
-### Verification
-- Foreign server traffic stats must show non-zero `up`/`down` after test requests
-- `netstat -tn` on foreign port 22220 should show connections from RU container IP
-- Hiddify VLESS link must point to RU container (localhost:11111), NOT foreign
-
-### Limitations
-- Both containers share the same external IP (same Docker host) — cannot verify exit IP difference
-- SSH, ufw, firewalld checks are irrelevant in Docker
-- Reality/TLS testing requires a real domain
-
-## 3X-UI API Pitfalls
-
-### CSRF Protection
-3X-UI has CSRF protection. All API calls require:
-1. GET `/csrf-token` → extract `obj` field as CSRF token
-2. POST `/login` with `{"username":"admin","password":"admin"}` + `X-CSRF-Token` header
-3. All subsequent requests need `X-CSRF-Token` header
-
-### Xray Config Update
-The `/panel/xray/update` endpoint expects form-encoded data with field name `xraySetting`:
-```python
-import requests, json
-s = requests.Session()
-# ... login ...
-config = s.get('http://host:port/panel/xray/getDefaultJsonConfig').json()['obj']
-# Modify config['outbounds'], config['routing']['rules'], etc.
-s.post('http://host:port/panel/xray/update',
-       data={'xraySetting': json.dumps(config)},
-       headers={'X-CSRF-Token': csrf})
-```
-**Pitfall:** Sending as JSON body or wrong field name returns `"unexpected end of JSON input"`. Must use `data=` (form-encoded) with field name `xraySetting`.
-
-### Two-Step Configuration Process
-3X-UI separates inbound management (database) from outbound/routing (Xray template). You cannot configure everything through one API call:
-
-**Step A — Create inbounds** via `/panel/api/inbounds/add` (JSON body). This creates the database records. Both Hiddify inbound (RU) and service inbound (foreign) are created this way.
-
-**Step B — Configure outbound + routing** via `/panel/xray/update` (form field `xraySetting`). First fetch the current template with `GET /panel/xray/getDefaultJsonConfig`, then add your outbound and routing rule to it, then POST back. Without this step, Xray has no outbound to the foreign server and no routing rule.
-
-**Step C — Restart** the container or service to apply the new Xray config.
-
-### Default Credentials
-Fresh 3X-UI Docker image uses `admin` / `admin`. Change after first login in production.
-
-### Inbound Creation
-```python
-s.post('http://host:port/panel/api/inbounds/add',
-       json={...},  # JSON body works for inbounds
-       headers={'X-CSRF-Token': csrf})
-```
-Supported protocols: `vmess vless trojan shadowsocks wireguard hysteria http mixed tunnel`. SOCKS is NOT supported — use `mixed` for HTTP+SOCKS proxy.
-
-### Config Persistence
-3X-UI stores Xray template in SQLite `settings` table with key `xraySetting`. Inbounds are in the `inbounds` table. On restart, `config.json` is regenerated from the database. Direct file edits are overwritten on restart.
-
-### Port Conflict
-Default metrics listener uses `127.0.0.1:11111` which conflicts with custom inbounds on port 11111. Change `metrics.listen` to a different port (e.g., `127.0.0.1:62790`) before adding inbounds on 11111.
-
-### SQLite WAL Mode
-The database uses WAL mode. To read/modify from outside the container:
-1. Install sqlite in container: `apk add --no-cache sqlite`
-2. Checkpoint WAL: `sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);"`
-3. Then copy: `docker cp container:/etc/x-ui/x-ui.db /tmp/db.sqlite`
-
 ## Completion Checklist
 
-- [ ] User explicitly approved configuration work.
+- [ ] User explicitly approved the work (approved_scope captured).
 - [ ] SSH access uses the already configured local SSH key where possible.
 - [ ] SSH access to both servers verified.
-- [ ] Preflight checks completed on both servers before any change.
-- [ ] Backup created before touching 3X-UI, Xray, routing, or firewall.
+- [ ] Discovery completed on both servers (system, firewall, 3x-ui version, API capabilities).
+- [ ] 3X-UI API discovery run; API mode (modern/legacy) recorded; auth method recorded.
+- [ ] Backup created before touching 3X-UI, Xray, routing, or firewall (WAL-safe DB copy).
+- [ ] Change plan built with reuse/update/create per object before applying.
+- [ ] Port collision check run before creating inbounds; metrics listener detected dynamically.
+- [ ] Existing 3x-ui installation not reinstalled and existing objects not overwritten without need.
 - [ ] Rollback path is known and can be explained.
-- [ ] OS, sudo/root, firewall, ports checked.
-- [ ] Provider firewall/security group checked if local port looks open but is still unreachable.
-- [ ] 3X-UI checked or installed on both servers.
-- [ ] 3X-UI/Xray version checked when compatibility or protocol behavior matters.
-- [ ] Foreign server service client created only for RU → foreign.
-- [ ] Russian server user client created for Hiddify only.
-- [ ] Foreign server configured as exit.
-- [ ] Russian server configured as Hiddify entry.
-- [ ] RU outbound points to foreign inbound.
-- [ ] RU routing sends Hiddify inbound to foreign outbound.
-- [ ] Only needed ports opened.
-- [ ] Hiddify profile points to RU server.
-- [ ] Hiddify profile was checked to ensure the foreign host/IP is not the primary target.
+- [ ] Foreign server configured as exit and validated locally before RU changes.
+- [ ] RU outbound points to foreign inbound; RU routing sends Hiddify inbound to foreign outbound.
+- [ ] Live apply attempted first; restart done only with a stated reason.
+- [ ] Hiddify profile points to RU server; foreign host/IP is not the primary target.
+- [ ] Hiddify profile fields validated (scheme/host/port/UUID/security/Reality/SNI/fingerprint/flow/transport).
 - [ ] Client-side verification on Windows 11 was performed or explicitly delegated to the user.
-- [ ] Client external IP verified as foreign, or user asked to verify.
+- [ ] TCP end-to-end verified; external IP verified as foreign.
+- [ ] DNS test run (PASS/WARNING/FAIL); IPv6 test run; UDP test run or marked N/A.
+- [ ] Acceptance test table produced; all critical tests PASS or rollback executed.
 - [ ] Final report contains no secrets unless explicitly approved.
 - [ ] No claims of guaranteed anonymity or universal blocking resistance.
+
+## 3X-UI API Quick Notes
+
+Full endpoint matrix, discovery curls, and payload examples: `references/api-compatibility.md`.
+
+### CSRF Protection (session auth)
+
+All session-based API calls require:
+
+1. `GET /csrf-token` → extract `obj` field as CSRF token.
+2. `POST /login` with `{"username":"...","password":"..."}` + `X-CSRF-Token` header.
+3. All subsequent requests need the `X-CSRF-Token` header + session cookie.
+
+API token (Settings → Security → API Token) bypasses CSRF entirely — prefer it when configured. Never assume default credentials (`admin/admin` is only for fresh Docker test environments, and even there change it after first login); production workflow must always ask for credentials.
+
+### Xray Config Update
+
+The Xray template update endpoint expects **form-encoded** data with field name `xraySetting` (modern path: `/panel/api/xray/update`, legacy: `/panel/xray/update`). Sending a JSON body or a wrong field name returns `"unexpected end of JSON input"`. Use typed nested JSON when the API accepts it; fall back to string-serialized JSON only when required. Inbound client field `tgId` must be an int (`0`), not a string.
+
+### Two-Step Configuration Process
+
+3x-ui separates inbound management (database) from outbound/routing (Xray template):
+
+**Step A — inbounds** via the inbounds API (JSON body). Both the Hiddify inbound (RU) and the service inbound (foreign) are created this way.
+
+**Step B — outbound + routing** via the Xray template update (form field `xraySetting`): fetch the current template, add outbound and routing rule, POST back. Without this step Xray has no outbound to foreign and no routing rule.
+
+**Step C — apply.** Prefer live apply; restart the service/container only if live apply is unavailable or fails.
+
+### Inbound Creation
+
+JSON body works for inbounds. Supported protocols include: `vmess vless trojan shadowsocks wireguard hysteria http mixed tunnel` (verify against the installed version — the list changes between releases). SOCKS is NOT a standalone protocol — use `mixed` for HTTP+SOCKS.
+
+### Config Persistence
+
+3x-ui stores the Xray template in SQLite `settings` table (key `xraySetting`). Inbounds are in the `inbounds` table. On restart, `config.json` is regenerated from the database. Direct file edits are overwritten on restart.
+
+### SQLite WAL Mode
+
+The database uses WAL mode. To copy it safely from outside the container: install sqlite in the container (`apk add --no-cache sqlite`), checkpoint WAL (`sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);"`), then `docker cp container:/etc/x-ui/x-ui.db /tmp/db.sqlite` — or prefer 3x-ui's built-in backup mechanism when available. Never copy a live WAL-active DB as a single plain file copy.

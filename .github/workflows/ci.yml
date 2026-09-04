@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  THREEXUI_VERSION: v3.7.0
+
+jobs:
+  markdown-metadata:
+    name: Markdown & metadata validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate SKILL.md frontmatter
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          text = open("SKILL.md", encoding="utf-8").read()
+          m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+          assert m, "SKILL.md: frontmatter missing"
+          fm = m.group(1)
+          for field in ("name", "description", "version"):
+              assert re.search(rf"^{field}:", fm, re.M), f"SKILL.md: missing field '{field}'"
+          vm = re.search(r"^version:\s*(\S+)", fm, re.M)
+          assert vm, "SKILL.md: version missing"
+          assert vm.group(1) == "2.0.0", f"SKILL.md: version must be 2.0.0, got {vm.group(1)}"
+          readme = open("README.md", encoding="utf-8").read()
+          assert "2.0.0" in readme, "README.md: version 2.0.0 not mentioned"
+          print("metadata OK: version 2.0.0")
+          EOF
+
+      - name: Validate markdown links
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys
+          errors = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+              for f in files:
+                  if not f.endswith(".md"):
+                      continue
+                  path = os.path.join(root, f)
+                  text = open(path, encoding="utf-8").read()
+                  # skip inline code blocks to avoid matching non-link text
+                  text = re.sub(r"```.*?```", "", text, flags=re.S)
+                  for m in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", text):
+                      target = m.group(1).strip()
+                      if target.startswith(("http://", "https://", "mailto:", "#")):
+                          continue
+                      target = target.split("#")[0]
+                      if not target:
+                          continue
+                      t = os.path.normpath(os.path.join(root, target))
+                      if not os.path.exists(t):
+                          errors.append(f"{path}: broken link -> {target}")
+          if errors:
+              print("\n".join(errors))
+              sys.exit(1)
+          print("all relative markdown links OK")
+          EOF
+
+  docker-integration:
+    name: Docker integration test (pinned 3x-ui)
+    runs-on: ubuntu-latest
+    needs: markdown-metadata
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install requests
+
+      - name: Run cascade integration + idempotency test
+        env:
+          THREEXUI_VERSION: v3.7.0
+        run: python tests/cascade_docker_test.py
+
+      - name: Latest compatibility probe (non-blocking)
+        continue-on-error: true
+        env:
+          THREEXUI_VERSION: latest
+        run: python tests/cascade_docker_test.py
