@@ -56,10 +56,15 @@ references/
 ├── api-compatibility.md                   — матрица endpoints, capability detection, auth, payload
 ├── troubleshooting.md                     — structured troubleshooting, MTU/MSS, логи
 ├── acceptance-tests.md                    — таблица тестов, critical tests, DNS/IPv6/UDP, negative tests
-└── security-and-rollback.md               — секреты, WAL-safe backup, алгоритм отката
+└── security-and-rollback.md               — секреты, WAL-safe backup, drift-защита, алгоритм отката
 tests/
-└── cascade_docker_test.py                 — Docker-интеграционный тест + идемпотентность
-.github/workflows/ci.yml                   — CI: markdown/metadata validation + Docker-тест
+├── cascade_lib.py                         — общая библиотека: semantic diff, planned updates, restore
+├── cascade_docker_test.py                 — интеграционный тест + drift + backup/rollback exact-restore
+├── rollback_rehearsal.py                  — полный rollback rehearsal (Snapshot A → damage → rollback)
+├── negative_tests.py                      — матрица из 10 негативных сценариев
+└── reality_test.py                        — Reality compatibility (обе ноги VLESS+Reality, vision)
+.github/workflows/ci.yml                   — CI: metadata/markdown + integration + negative (blocking);
+                                             Reality + latest probe (еженедельно, отдельно)
 ```
 
 ## Безопасность
@@ -74,9 +79,19 @@ tests/
 
 ## Версия
 
-Текущая версия: `2.0.0`
+Текущая версия: `2.0.1`
 
 ## Changelog
+
+### 2.0.1
+
+- **P0 — backup текущего шаблона:** backup Xray template исправлен — читается **текущий сохранённый** шаблон через `POST /panel/api/xray/` (getXraySetting) c извлечением `xraySetting`, а не `getDefaultJsonConfig` (тот возвращает дефолт). Rollback использует именно этот snapshot. Тест «current config → backup → modification → rollback → exact restore» — PASS.
+- **P0/P1 — защита от незапланированных изменений:** перед каждым `POST .../xray/update` снимается semantic snapshot; после обновления — semantic diff; изменения вне change plan (routing rules, outbounds, DNS, balancers, policy, другие секции) → `UNPLANNED CONFIG DRIFT` и автоматический rollback. Реализация: `tests/cascade_lib.py` (`planned_update`, `semantic_template_diff`), покрыта тестами.
+- **P1 — настоящий rollback integration test:** `tests/rollback_rehearsal.py`: Snapshot A → configure cascade → intentional damage → rollback → сравнение со Snapshot A. PASS только при побайтовом восстановлении шаблонов, удалении созданных объектов, неизменности старых и работоспособном baseline.
+- **P1 — negative-матрица автоматизирована:** `tests/negative_tests.py` — 10 сценариев (occupied ports, invalid UUID, foreign unreachable, wrong endpoint, CSRF/auth, wrong credentials, conflicting inbound, invalid xraySetting, broken routing tag) с проверками «clear failure / no destructive overwrite / no duplicates / recovery». CI — blocking.
+- **P2 — исправлен DNS acceptance test:** убран ошибочный `whoami.cloudflare.esk`; добавлена воспроизводимая процедура (resolver-echo `whoami.akamai.net`, `o-o.myaddr.l.google.com`, leak-test страницы, детекция fake-ip) с матрицей PASS / WARNING / FAIL и запретом вывода по одному nslookup.
+- **P2 — Reality compatibility test:** `tests/reality_test.py` — полный прод-сценарий client → VLESS+Reality → RU → VLESS+Reality → Foreign → Internet: x25519-пары per-server, role-check приватных ключей, shortId/SNI/fingerprint/`xtls-rprx-vision`, валидация share URI (host == RU), сквозной трафик, счётчики foreign. Отдельный CI job (scheduled/manual).
+- **CI:** pinned `v3.7.0` — blocking (integration + rollback rehearsal + negative matrix); `latest` — отдельный non-blocking job; недельный schedule (пн 03:00 UTC) прогоняет pinned + latest + Reality.
 
 ### 2.0.0
 
@@ -117,11 +132,14 @@ Tested against конкретные версии (не «latest»):
 
 ## Docker testing
 
-Быстрый прогон интеграционного теста на одной машине:
+Быстрый прогон на одной машине (официальный образ, pinned версия):
 
 ```bash
-THREEXUI_VERSION=v3.7.0   # зафиксированная версия, см. tests/cascade_docker_test.py
-python tests/cascade_docker_test.py
+THREEXUI_VERSION=v3.7.0   # зафиксированная версия
+python tests/cascade_docker_test.py      # каскад + drift + backup/rollback
+python tests/rollback_rehearsal.py       # полный rehearsal
+python tests/negative_tests.py           # негативная матрица
+python tests/reality_test.py             # Reality compatibility (обе ноги)
 ```
 
-Скрипт поднимает два контейнера `ghcr.io/mhsanaei/3x-ui:$THREEXUI_VERSION`, настраивает каскад через API, прогоняет трафик, проверяет exit-путь и повторно запускает фазу конфигурации (идемпотентность). Подробности — `references/cascade-implementation-notes.md`.
+Подробности — `references/cascade-implementation-notes.md`. CI (GitHub Actions): на каждый push — metadata/markdown, интеграция, rehearsal и negative-матрица (blocking, pinned); еженедельно по понедельникам дополнительно Reality compatibility и `latest` probe.

@@ -39,7 +39,7 @@ Version numbers are hints only. A capability check always wins over a version ch
 | Test an outbound | `POST /panel/api/xray/testOutbound` (form: `outbound` JSON, `mode` = `tcp`/`real`, optional `allOutbounds` JSON) | — |
 | Restart Xray core | `POST /panel/api/xray/restart` (may not exist) | panel UI button / `x-ui restart` / container restart |
 
-**Critical read-modify-write rule (verified on v3.7.0):** `getDefaultJsonConfig` returns the **DEFAULT** template, not the current one. Using it as the read source overwrites existing outbounds/routing on update. Always read the CURRENT template via `POST /panel/api/xray/` (getXraySetting) → response `{"obj": "<json string>"}` → parse → `obj.xraySetting` → modify → `POST .../update` with form field `xraySetting`.
+**Critical read-modify-write rule (verified on v3.7.0):** `getDefaultJsonConfig` returns the **DEFAULT** template, not the current one. Using it as the read source overwrites existing outbounds/routing on update — and as a *backup source* it stores the wrong (default) configuration instead of the production state. Always read the CURRENT template via `POST /panel/api/xray/` (getXraySetting) → response `{"obj": "<json string>"}` → parse → `obj.xraySetting` → modify → `POST .../update` with form field `xraySetting`. Backups and rollback snapshots must come from this same current-template read (see `references/security-and-rollback.md`).
 
 ### Inbounds (database objects)
 

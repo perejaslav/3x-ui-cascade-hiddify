@@ -87,9 +87,14 @@ docker cp <container>:/etc/x-ui/x-ui.db "$BACKUP_DIR/x-ui.db"   # Docker install
 Also export the logical state via API when possible (read-only):
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" "$PANEL/panel/api/inbounds/list" > "$BACKUP_DIR/inbounds.json"
-curl -s $AUTH "$PANEL/panel/api/xray/getDefaultJsonConfig" > "$BACKUP_DIR/xray-template.json"
+# CURRENT saved template — read via getXraySetting (POST /panel/api/xray/).
+# NEVER use GET getDefaultJsonConfig for backup: it returns the DEFAULT
+# template, not the production configuration (verified on v3.7.0).
+curl -s $AUTH -X POST "$PANEL/panel/api/xray/" > "$BACKUP_DIR/xray-getsetting.raw"
+curl -s $AUTH "$PANEL/panel/api/inbounds/list" > "$BACKUP_DIR/inbounds.json"
 ```
+
+Extract `obj` → parse JSON → take `xraySetting` (unwrap again if it is still a string) and save it as the rollback artifact `xray-template.json`. The helper in `tests/cascade_lib.py` (`Panel.get_saved_template` / `Panel.backup_template`) implements exactly this; rollback must restore **this** snapshot, not the default template.
 
 Backup content checklist:
 
@@ -112,6 +117,47 @@ Rollback is a mandatory part of the transaction, not advice. Trigger: critical a
 ```text
 failure → diagnose → rollback → verify restored state
 ```
+
+## Semantic snapshot and UNPLANNED CONFIG DRIFT protection (mandatory)
+
+Before **every** `POST /panel/api/xray/update`:
+
+1. Read the current saved template (`POST /panel/api/xray/` → `xraySetting`) and keep a semantic snapshot.
+2. Build the intended full template state (the change plan) and send it.
+3. After the update, read the template again and compute a semantic diff (JSON-pointer diff) between the pre-update snapshot and the post-update state.
+4. Every actual changed path must match the change plan exactly. In particular verify that no foreign (not planned) changes appeared in:
+   - routing rules;
+   - outbounds;
+   - DNS settings;
+   - balancers;
+   - policy;
+   - log/api/metrics/other Xray sections.
+
+If anything outside the plan changed or disappeared:
+
+```text
+UNPLANNED CONFIG DRIFT
+```
+
+→ immediately restore the pre-update snapshot (rollback) and re-verify, then report the drifted paths.
+
+Reference implementation: `tests/cascade_lib.py` — `semantic_template_diff`, `assert_changes_planned`, `Panel.planned_update` (detects drift, restores the pre-update snapshot automatically), `Panel.restore_template` (requires byte-exact canonical re-read). Exercised by `tests/cascade_docker_test.py` (planned + drift probe) and `tests/rollback_rehearsal.py` (full rehearsal).
+
+Note: the panel may reorder `routing.rules` on save (e.g. it keeps the `api` rule first) — compare rule lists as multisets, but positionally everywhere else.
+
+## Rollback rehearsal (mandatory before real-server work)
+
+A rollback procedure that has never been rehearsed is a plan, not a capability. Before declaring a production run successful, exercise the full cycle (automated against pinned Docker: `tests/rollback_rehearsal.py`):
+
+```text
+Snapshot A (templates + inbound lists, pre-change)
+→ configure cascade
+→ intentionally damage critical config
+→ trigger rollback (restore snapshots, remove created inbounds)
+→ compare final state with Snapshot A
+```
+
+PASS only if both templates are byte-exactly restored, created test objects are deleted, old objects are unchanged, and the baseline is healthy again. On real VPS servers run the same rehearsal during planning (before touching the working inbound) so the rollback path is proven, not assumed.
 
 ### Preconditions (checked during planning, before any change)
 

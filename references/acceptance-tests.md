@@ -79,25 +79,55 @@ Client-observed IP == foreign server IP/network. If the client machine is availa
 
 ### DNS test (mandatory)
 
-Determine which resolver is actually used:
+Goal: determine which resolver is actually used and detect DNS leaking directly through RU/local ISP when foreign egress is expected. Never conclude from a single `nslookup` — cross-check several probes.
 
-```powershell
-# Windows client
-nslookup whoami.akamai.net          # resolver identity
-Resolve-DnsName whoami.cloudflare.esk
+**Step 1 — which resolver answers?** Use a resolver-echo service: the DNS name `whoami.akamai.net` resolves to the IP of the resolver that queried it. Query it through the tunnel and compare with direct:
+
+```bash
+# through the tunnel (client with proxy DNS, or on the exit server)
+nslookup whoami.akamai.net
+dig +short whoami.akamai.net
+
+# baseline: the resolver seen without the tunnel (for comparison)
+nslookup whoami.akamai.net 1.1.1.1
 ```
 
-Or use a test domain that echoes the resolver's egress location. Then check for leaks: when foreign egress is expected, DNS must not resolve directly through RU/local ISP resolvers.
+**Step 2 — is the resolved egress foreign?** Use an IP-geolocation echo domain (returns the location of the querying resolver):
+
+```bash
+dig +short o-o.myaddr.l.google.com @ns1.google.com   # TXT answer: resolver IP seen by Google
+nslookup -type=TXT o-o.myaddr.l.google.com ns1.google.com
+```
+
+Compare the returned resolver IP/location with the foreign server location.
+
+**Step 3 — behavioral probe (Windows client):** open a DNS-leak test page through the connected profile and check that no RU/local ISP resolvers appear:
+
+```text
+https://dnsleaktest.com        → Extended test
+https://www.dnsleak.com
+```
+
+**Step 4 — consistency check:** repeat step 1 twice (stability) and confirm the resolver set does not include the user's ISP when the tunnel is up.
+
+Decision matrix:
+
+```text
+PASS     resolver echoes foreign location (or user-approved local resolver);
+         no ISP resolvers in the leak test; repeated probes stable
+WARNING  resolver location unknown, mixed (some foreign, some local),
+         or fake-ip client-side resolver detected (198.18.0.0/15 answers)
+         — results unusable, redo the probe with real resolvers
+FAIL     RU/local ISP resolver observed while foreign egress is expected (leak)
+```
+
+Note (fake-ip environments): if the client machine runs a VPN/fake-ip client, all DNS — even direct queries to public resolvers — may answer with `198.18.x.x`. Detect it first (any domain resolving into `198.18.0.0/15`), mark the probe WARNING, and re-test from a clean resolver context (e.g. query `whoami.akamai.net` directly against `1.1.1.1` from the RU server through the tunnel).
 
 Output:
 
 ```text
 DNS STATUS: PASS / WARNING / FAIL
 ```
-
-- PASS — DNS egress follows the foreign path (or local-by-design and user approved).
-- WARNING — resolver location unknown or mixed.
-- FAIL — DNS goes through RU/local ISP while traffic goes foreign (leak).
 
 ### IPv6 test (mandatory)
 
@@ -132,22 +162,22 @@ PASS requires: backup exists on both servers, rollback commands were derived fro
 
 ## Negative tests (Docker/CI)
 
-The Docker/CI acceptance suite must exercise failure modes and verify the skill degrades safely with clear diagnostics and without destroying the existing setup:
+The following failure modes are **automated** in `tests/negative_tests.py` (runs in CI, blocking, against the pinned official image). Each scenario asserts: clear failure, no destructive overwrite, no unwanted duplicates, no unrelated config changes, and rollback/recovery where applicable:
 
 ```text
-occupied foreign port
-occupied RU port
-invalid foreign UUID
-broken routing tag (routing → nonexistent outbound)
-foreign unreachable (foreign container stopped)
-wrong API endpoint (404 path)
-CSRF required (no token/cookie sent)
-wrong credentials
-existing conflicting inbound (same port/tag created beforehand)
-Xray config invalid (malformed xraySetting)
+occupied foreign port          — pre-check detects listener; stray inbound cleaned up; Xray healthy
+occupied RU port               — pre-check detects listener
+invalid foreign UUID           — update rejected or breakage detected; rollback recovers
+foreign unreachable            — bogus hostname; clear failure; rollback recovers
+wrong API endpoint             — unknown paths return 404; config untouched
+CSRF/auth failure              — unauthenticated writes rejected; nothing applied
+wrong credentials              — login rejected; no state change
+conflicting existing inbound   — conflict STOP (unit) + live duplicate-port rejection; cleanup works
+invalid xraySetting            — malformed JSON / wrong shape; config not corrupted; recovery works
+broken routing tag             — traffic fails; rollback restores; traffic works
 ```
 
-Expected behavior for each: readable error, no partial objects left behind, existing objects untouched, no auto-deletion.
+Docker-scope limits still apply (see below): provider firewall, Reality in a real network, Hiddify on Windows, real DNS leaks and UDP over the production path are NOT covered by these automated tests and must be verified manually on real VPS during acceptance.
 
 ## Re-run / idempotency test (mandatory)
 

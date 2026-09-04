@@ -1,7 +1,7 @@
 ---
 name: 3x-ui-cascade-hiddify
 description: Use when configuring two 3X-UI/Xray servers as a cascade where Hiddify on Windows connects to a Russian entry server, which forwards traffic to a foreign exit server. Version-aware, capability-aware, idempotent, transactional with backup and rollback.
-version: 2.0.0
+version: 2.0.1
 author: Hermes Agent
 license: MIT
 platforms: [linux, windows]
@@ -22,8 +22,10 @@ Support files:
 - `references/cascade-implementation-notes.md` — implementation notes, client-role split, protocol cautions, Docker simulation.
 - `references/api-compatibility.md` — 3x-ui API endpoint matrix, capability detection, discovery procedure, curl examples.
 - `references/acceptance-tests.md` — full acceptance test table, critical tests, negative tests, DNS/IPv6/UDP procedures.
-- `references/security-and-rollback.md` — secret handling, backup procedure (SQLite WAL-safe), detailed rollback commands.
+- `references/security-and-rollback.md` — secret handling, backup procedure (SQLite WAL-safe, current-template snapshot), UNPLANNED CONFIG DRIFT protection, detailed rollback commands and rehearsal.
 - `references/troubleshooting.md` — structured symptom → check → fix tables, MTU/MSS diagnostics, log collection.
+
+Test suites (Docker, official pinned image): `tests/cascade_lib.py` (shared library: semantic diff, planned updates, byte-exact restore), `tests/cascade_docker_test.py`, `tests/rollback_rehearsal.py`, `tests/negative_tests.py`, `tests/reality_test.py`.
 
 ```text
 Windows 11 + Hiddify → Russian 3X-UI server → foreign 3X-UI server → internet
@@ -371,6 +373,14 @@ Default to live apply; restart is the exception:
 change config → attempt live apply → validate
 ```
 
+**Planned-update discipline (mandatory for every Xray template update):** before each `POST /panel/api/xray/update`, snapshot the current template semantically; after the update, re-read and compute a semantic diff against the pre-update state. Every actual change must match the change plan. If routing rules, outbounds, DNS, balancers, policy, or any other Xray section changed or disappeared outside the plan:
+
+```text
+UNPLANNED CONFIG DRIFT
+```
+
+→ immediately restore the pre-update snapshot and re-verify. Reference implementation: `tests/cascade_lib.py` (`planned_update`, `restore_template`); exercised in `tests/cascade_docker_test.py` and `tests/rollback_rehearsal.py`.
+
 Restart only if:
 
 - live apply is unavailable;
@@ -498,7 +508,8 @@ When no real VPS servers are available, the cascade can be simulated with two Do
 
 Key constraints:
 
-- Use the official image `ghcr.io/mhsanaei/3x-ui` with a **pinned version** for acceptance tests (e.g. `THREEXUI_VERSION=v3.7.0`). Never `latest` as the default; a separate compatibility run with `latest` is allowed.
+- Use the official image `ghcr.io/mhsanaei/3x-ui` with a **pinned version** for acceptance tests (e.g. `THREEXUI_VERSION=v3.7.0`). Never `latest` as the default; a separate compatibility run with `latest` is allowed (weekly CI job, non-blocking).
+- Automated suites: `tests/cascade_docker_test.py` (cascade + drift detection + backup/restore), `tests/rollback_rehearsal.py` (full rollback rehearsal), `tests/negative_tests.py` (10-scenario negative matrix), `tests/reality_test.py` (Reality compatibility, scheduled).
 - 3x-ui API has CSRF protection — get token from `/csrf-token` first, login with `username`/`password` fields (not `user`/`passwd`); API token (Settings → Security) bypasses CSRF when available.
 - Never edit `config.json` directly — 3x-ui regenerates it from SQLite on restart.
 - Outbound connections and routing rules are NOT in the database — they live in the Xray template (update via the Xray API).
@@ -541,7 +552,7 @@ or
 ROLLBACK STATUS: PARTIAL FAILURE
 ```
 
-With `PARTIAL FAILURE`, list explicitly what remains changed. Detailed commands: `references/security-and-rollback.md`.
+With `PARTIAL FAILURE`, list explicitly what remains changed. Detailed commands, semantic-snapshot discipline, and the rollback rehearsal requirement (Snapshot A → damage → rollback → compare): `references/security-and-rollback.md`. Automated rehearsal: `tests/rollback_rehearsal.py`.
 
 ## Final Report Format
 
@@ -604,6 +615,8 @@ Acceptance tests: (таблица PASS/FAIL/N/A — см. references/acceptance-
 - [ ] Foreign server configured as exit and validated locally before RU changes.
 - [ ] RU outbound points to foreign inbound; RU routing sends Hiddify inbound to foreign outbound.
 - [ ] Live apply attempted first; restart done only with a stated reason.
+- [ ] Semantic pre/post diff checked on every template update; UNPLANNED CONFIG DRIFT would trigger rollback.
+- [ ] Backup created from the CURRENT saved template (getXraySetting), never from getDefaultJsonConfig.
 - [ ] Hiddify profile points to RU server; foreign host/IP is not the primary target.
 - [ ] Hiddify profile fields validated (scheme/host/port/UUID/security/Reality/SNI/fingerprint/flow/transport).
 - [ ] Client-side verification on Windows 11 was performed or explicitly delegated to the user.
