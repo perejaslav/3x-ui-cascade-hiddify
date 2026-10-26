@@ -79,9 +79,18 @@ tests/
 
 ## Версия
 
-Текущая версия: `2.0.1`
+Текущая версия: `2.1.0`
 
 ## Changelog
+
+### 2.1.0 (hardening)
+
+- Docker test resources are scoped to the current run; port publications bind only to localhost.
+- Version selection honors `THREEXUI_VERSION`; pinned CI target updated to 3x-ui v3.11.0 (bundling Xray-core v26.10.21). Compatibility must be confirmed by a successful CI run.
+- Planned template update now rejects incomplete application and verifies rollback outcome.
+- Reality test redacts sensitive X25519 command output on parse errors.
+- Separate deterministic regression tests for semantic diff, version selection and safe cleanup.
+- Hiddify Windows GUI, live VPS, DNS/IPv6/UDP leak tests remain manual acceptance gates.
 
 ### 2.0.1
 
@@ -123,8 +132,8 @@ Tested against конкретные версии (не «latest»):
 
 | Component | Tested | Notes |
 |---|---|---|
-| 3x-ui | v3.7.0 | modern API `/panel/api/*`; legacy fallback проверен по матрице |
-| Xray-core | v26.3.27 | идёт в комплекте 3x-ui v3.7.0 |
+| 3x-ui | v3.11.0 | Docker cascade, rollback, negative tests, VLESS+Reality (2026-10-26) |
+| Xray-core | v26.10.21 | bundled in 3x-ui v3.11.0; confirmed in container logs |
 | Hiddify Windows | v4.1.1 | VLESS+Reality, ручной профиль и share-link |
 | Ubuntu | 22.04, 24.04 | systemd install |
 | Debian | 11, 12 | systemd install |
@@ -135,7 +144,7 @@ Tested against конкретные версии (не «latest»):
 Быстрый прогон на одной машине (официальный образ, pinned версия):
 
 ```bash
-THREEXUI_VERSION=v3.7.0   # зафиксированная версия
+THREEXUI_VERSION=v3.11.0   # текущая закреплённая версия (environment override)
 python tests/cascade_docker_test.py      # каскад + drift + backup/rollback
 python tests/rollback_rehearsal.py       # полный rehearsal
 python tests/negative_tests.py           # негативная матрица

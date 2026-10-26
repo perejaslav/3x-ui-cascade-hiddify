@@ -69,7 +69,7 @@ def x25519_keypair(container):
     priv = re.search(r"PrivateKey:\s*(\S+)", out)
     pub = re.search(r"Password \(PublicKey\):\s*(\S+)", out)
     if not priv or not pub:
-        raise RuntimeError(f"cannot parse x25519 output:\n{out}")
+        raise RuntimeError("cannot parse x25519 output (redacted; may contain private key)")
     return priv.group(1), pub.group(1)
 
 
@@ -116,9 +116,9 @@ def main():
     docker_cleanup(names=(lib.RU_NAME, lib.FOREIGN_NAME, CLIENT_NAME))
     docker_up()
     img = f"{lib.IMAGE}:{lib.THREEXUI_VERSION_DEFAULT}"
-    sh(["docker", "run", "-d", "--name", CLIENT_NAME, "--network", lib.NETWORK,
-        "--hostname", CLIENT_NAME, "-p", f"{CLIENT_HTTP_PORT}:{CLIENT_HTTP_PORT}",
-        "--entrypoint", "/bin/sh", img, "-c", "sleep 3600"], check_rc=True)
+    lib.docker_run_owned(["--network", lib.NETWORK,
+        "--hostname", CLIENT_NAME, "-p", f"127.0.0.1:{CLIENT_HTTP_PORT}:{CLIENT_HTTP_PORT}",
+        "--entrypoint", "/bin/sh", img, "-c", "sleep 3600"], CLIENT_NAME)
     wait_panel(lib.FOREIGN_URL, "foreign")
     wait_panel(lib.RU_URL, "ru")
     foreign, ru = connect_panels()

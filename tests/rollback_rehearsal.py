@@ -123,8 +123,8 @@ def main():
         base_ok = r.status_code < 500
     except _rq.RequestException:
         base_ok = False
-    results.check("Baseline internet reachable after rollback", base_ok,
-                  "direct (no proxy) — Xray baseline state healthy")
+    results.check("Host internet reachable after rollback (not Xray health)", base_ok,
+                  "direct host connection; Xray baseline needs separate verification")
 
     print("\nRollback verdict:")
     all_ok = ru_tpl_ok and f_tpl_ok and ru_inb_ok and f_inb_ok and base_ok

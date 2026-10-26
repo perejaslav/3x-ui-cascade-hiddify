@@ -26,16 +26,18 @@ import subprocess
 import time
 import random
 import string
+import os
+import secrets
 
 import requests
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-THREEXUI_VERSION_DEFAULT = "v3.7.0"
+THREEXUI_VERSION_DEFAULT = "v3.11.0"
 IMAGE = "ghcr.io/mhsanaei/3x-ui"
 PANEL_USER = "admin"   # Docker-test-only credentials (fresh container)
-PANEL_PASS = "admin"
+PANEL_PASS = secrets.token_urlsafe(24)  # unique per isolated test run
 
 NETWORK = "cascade-net"
 FOREIGN_NAME = "foreign-cascade"
@@ -202,6 +204,19 @@ def assert_changes_planned(before, after, plan):
     ignored); everything else is compared positionally.
     """
     changed = semantic_template_diff(before, after)
+    # 3x-ui may place its API rule first when persisting the template.
+    # Compare the rule membership separately; all other paths stay strict.
+    def normalize(tpl):
+        result = copy.deepcopy(tpl)
+        rules = result.get("routing", {}).get("rules")
+        if isinstance(rules, list):
+            result["routing"]["rules"] = _normalize_rule_list(rules)
+        return result
+    # A successful write must reach the intended state, not merely avoid
+    # touching unrelated keys. Otherwise a no-op could incorrectly PASS.
+    missing = semantic_template_diff(normalize(after), normalize(plan))
+    if missing:
+        return False, missing, f"planned state not reached: {missing}"
 
     def value_matches(path):
         a, b, p = _get_path(before, path), _get_path(after, path), _get_path(plan, path)
@@ -365,10 +380,10 @@ class Panel:
         ok, unplanned, detail = assert_changes_planned(before, after, plan)
         if not ok:
             # UNPLANNED CONFIG DRIFT: roll back to the pre-update snapshot
-            self.restore_template(before)
+            restored = self.restore_template(before)
             raise RuntimeError(
                 f"{self.name}: UNPLANNED CONFIG DRIFT after '{label}': {detail} "
-                f"(rolled back to pre-update snapshot)")
+                f"(rollback {'verified' if restored else 'FAILED'})")
         print(f"  {self.name}: planned update '{label}' applied "
               f"({detail}, no drift)")
         return before, after
@@ -509,25 +524,52 @@ def shutil_which(name):
 
 
 def docker_cleanup(names=(RU_NAME, FOREIGN_NAME), network=NETWORK):
+    # Only resources explicitly created by this test invocation are removed.
     for name in names:
-        sh(["docker", "rm", "-f", name])
-    sh(["docker", "network", "rm", network])
+        if name in _created_containers:
+            sh(["docker", "rm", "-f", name], check_rc=True)
+            _created_containers.remove(name)
+    if network in _created_networks:
+        sh(["docker", "network", "rm", network], check_rc=True)
+        _created_networks.remove(network)
+
+
+_created_containers = set()
+_created_networks = set()
+
+
+def docker_run_owned(args, name):
+    sh(["docker", "run", "-d", "--name", name, *args], check_rc=True)
+    _created_containers.add(name)
+
+
+def provision_test_login(name):
+    """Set ephemeral credentials without printing them or relying on image defaults."""
+    result = subprocess.run(["docker", "exec", name, "/app/x-ui", "setting",
+                             "-username", PANEL_USER, "-password", PANEL_PASS],
+                            capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"Cannot provision isolated test login in {name} (output redacted)")
+    sh(["docker", "restart", name], check_rc=True)
 
 
 def docker_up(version=None, extra_ports=None):
-    version = version or THREEXUI_VERSION_DEFAULT
+    version = version or os.getenv("THREEXUI_VERSION", THREEXUI_VERSION_DEFAULT)
     img = f"{IMAGE}:{version}"
-    sh(["docker", "network", "create", NETWORK], check_rc=False)
+    sh(["docker", "network", "create", NETWORK], check_rc=True)
+    _created_networks.add(NETWORK)
     print(f"  pulling {img} ...")
     sh(["docker", "pull", img], check_rc=True)
-    sh(["docker", "run", "-d", "--name", FOREIGN_NAME, "--network", NETWORK,
+    docker_run_owned(["--network", NETWORK,
         "--hostname", FOREIGN_NAME,
-        "-p", f"{FOREIGN_PANEL_HOST_PORT}:2053",
-        "-p", f"{FOREIGN_INBOUND_PORT}:{FOREIGN_INBOUND_PORT}", img], check_rc=True)
-    sh(["docker", "run", "-d", "--name", RU_NAME, "--network", NETWORK,
+        "-p", f"127.0.0.1:{FOREIGN_PANEL_HOST_PORT}:2053",
+        "-p", f"127.0.0.1:{FOREIGN_INBOUND_PORT}:{FOREIGN_INBOUND_PORT}", img], FOREIGN_NAME)
+    docker_run_owned(["--network", NETWORK,
         "--hostname", RU_NAME,
-        "-p", f"{RU_PANEL_HOST_PORT}:2053",
-        "-p", f"{RU_INBOUND_PORT}:{RU_INBOUND_PORT}", img], check_rc=True)
+        "-p", f"127.0.0.1:{RU_PANEL_HOST_PORT}:2053",
+        "-p", f"127.0.0.1:{RU_INBOUND_PORT}:{RU_INBOUND_PORT}", img], RU_NAME)
+    provision_test_login(FOREIGN_NAME)
+    provision_test_login(RU_NAME)
 
 
 def wait_panel(base_url, name, timeout=180):
@@ -571,13 +613,15 @@ def ensure_foreign_inbound(foreign, service_uuid, port=FOREIGN_INBOUND_PORT,
                            stream_settings=None, client_flow=""):
     existing = foreign.find_inbound(FOREIGN_TAG)
     if existing:
+        if existing.get("port") != port or existing.get("protocol") != "vless":
+            raise RuntimeError("foreign inbound tag conflict: unexpected port/protocol — STOP")
         settings = as_dict(existing["settings"])
-        emails = [c.get("email") for c in settings.get("clients", [])]
-        if SERVICE_CLIENT_EMAIL in emails:
+        matches = [c for c in settings.get("clients", []) if c.get("email") == SERVICE_CLIENT_EMAIL]
+        if len(matches) == 1 and matches[0].get("id") == service_uuid:
             print(f"  foreign: inbound '{FOREIGN_TAG}' + client exist — reuse")
             return False
         raise RuntimeError(
-            f"conflict: inbound '{FOREIGN_TAG}' exists without service client — "
+            f"conflict: inbound '{FOREIGN_TAG}' service client missing or credentials mismatch — "
             "STOP, do not overwrite automatically")
     stream = stream_settings or {
         "network": "tcp", "security": "none", "externalProxy": [],
@@ -612,6 +656,7 @@ def ensure_foreign_egress(foreign):
     """Explicit DNS + freedom domainStrategy=UseIPv4 — deterministic egress
     even in fake-ip DNS environments (idempotent)."""
     tpl = foreign.get_saved_template()
+    before = copy.deepcopy(tpl)
     changed = False
     if not tpl.get("dns") or not tpl["dns"].get("servers"):
         tpl["dns"] = {"servers": ["8.8.8.8", "1.1.1.1"], "queryStrategy": "UseIPv4"}
@@ -623,9 +668,7 @@ def ensure_foreign_egress(foreign):
                                      domainStrategy="UseIPv4")
                 changed = True
     if changed:
-        resp = foreign.update_template(tpl)
-        if not resp.get("success"):
-            raise RuntimeError(f"foreign: egress template update failed: {resp}")
+        foreign.planned_update(tpl, lambda _: copy.deepcopy(tpl), label="foreign DNS egress")
         print("  foreign: egress DNS/domainStrategy configured (live apply)")
         time.sleep(3)
         return True
@@ -637,6 +680,8 @@ def ensure_ru_inbound(ru, port=RU_INBOUND_PORT, stream_settings=None,
                       client_flow=""):
     existing = ru.find_inbound(RU_TAG)
     if existing:
+        if existing.get("port") != port or existing.get("protocol") != "http":
+            raise RuntimeError("RU inbound tag conflict: unexpected port/protocol — STOP")
         print(f"  RU: inbound '{RU_TAG}' exists — reuse")
         return False
     stream = stream_settings or {

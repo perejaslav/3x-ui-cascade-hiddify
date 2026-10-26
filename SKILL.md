@@ -1,7 +1,7 @@
 ---
 name: 3x-ui-cascade-hiddify
 description: Use when configuring two 3X-UI/Xray servers as a cascade where Hiddify on Windows connects to a Russian entry server, which forwards traffic to a foreign exit server. Version-aware, capability-aware, idempotent, transactional with backup and rollback.
-version: 2.0.1
+version: 2.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, windows]

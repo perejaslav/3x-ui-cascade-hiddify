@@ -29,9 +29,9 @@ jobs:
               assert re.search(rf"^{field}:", fm, re.M), f"SKILL.md: missing field '{field}'"
           vm = re.search(r"^version:\s*(\S+)", fm, re.M)
           assert vm, "SKILL.md: version missing"
-          assert vm.group(1) == "2.0.1", f"SKILL.md: version must be 2.0.1, got {vm.group(1)}"
+          assert vm.group(1) == "2.1.0", f"SKILL.md: version must be 2.1.0, got {vm.group(1)}"
           readme = open("README.md", encoding="utf-8").read()
-          assert "2.0.1" in readme, "README.md: version 2.0.1 not mentioned"
+          assert "2.1.0" in readme, "README.md: version 2.1.0 not mentioned"
           print("metadata OK: version 2.0.1")
           EOF
 
@@ -76,16 +76,19 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install requests
+        run: pip install -r requirements-test.txt
+
+      - name: Offline safety regression suite
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Cascade integration + drift detection + backup/restore
         env:
-          THREEXUI_VERSION: v3.7.0
+          THREEXUI_VERSION: v3.11.0
         run: python tests/cascade_docker_test.py
 
       - name: Rollback rehearsal (Snapshot A -> damage -> rollback -> compare)
         env:
-          THREEXUI_VERSION: v3.7.0
+          THREEXUI_VERSION: v3.11.0
         run: python tests/rollback_rehearsal.py
 
   negative-tests:
@@ -100,11 +103,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install requests
+        run: pip install -r requirements-test.txt
 
       - name: Run negative test matrix (10 scenarios)
         env:
-          THREEXUI_VERSION: v3.7.0
+          THREEXUI_VERSION: v3.11.0
         run: python tests/negative_tests.py
 
   reality-compat:
@@ -120,11 +123,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install requests
+        run: pip install -r requirements-test.txt
 
       - name: Reality cascade end-to-end (VLESS+Reality both legs, vision)
         env:
-          THREEXUI_VERSION: v3.7.0
+          THREEXUI_VERSION: v3.11.0
         run: python tests/reality_test.py
 
   latest-compat:
@@ -141,7 +144,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install requests
+        run: pip install -r requirements-test.txt
 
       - name: Cascade integration against ghcr.io/mhsanaei/3x-ui:latest
         env:
